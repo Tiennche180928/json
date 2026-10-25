@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.parser import Parser
@@ -26,6 +27,7 @@ import stat
 import sys
 import tarfile
 import time
+import threading
 import zipfile
 
 # Tải từng tệp bằng HTTP để hạn chế RAM trên VM nhỏ; dùng lại đăng nhập HF có sẵn.
@@ -189,13 +191,23 @@ def inventory(api, control):
 
 
 class Downloads:
-    def __init__(self, root, revision):
+    def __init__(self, root, revision, workers=4):
         self.root, self.revision = root, revision
         self.by_content = {}
+        self.workers = workers
+        self.key_locks = {}
+        self.locks_guard = threading.Lock()
 
     def get(self, file):
-        from huggingface_hub import hf_hub_download
         key = (file.get('sha256') or file.get('blob_id'), file['size'])
+        lock_key = key if key[0] else file['path']
+        with self.locks_guard:
+            guard = self.key_locks.setdefault(lock_key, threading.Lock())
+        with guard:
+            return self._get(file, key)
+
+    def _get(self, file, key):
+        from huggingface_hub import hf_hub_download
         if key[0] and key in self.by_content:
             return self.by_content[key]
         if not safe(file['path']):
@@ -227,6 +239,27 @@ class Downloads:
                 delay = min(30, 5 * 2**attempt)
                 log(f'  Tải lỗi; thử lại sau {delay}s: {type(exc).__name__}')
                 time.sleep(delay)
+
+    def prefetch(self, files):
+        if self.workers == 1:
+            return
+        # Chỉ tải những vai trò chắc chắn cần đọc. Không tải mọi ZIP chuyển đổi.
+        unique = {}
+        for file in files:
+            key = (file.get('sha256') or file.get('blob_id') or file['path'], file['size'])
+            unique.setdefault(key, file)
+        if shutil.disk_usage(self.root).free < sum(f['size'] for f in unique.values()) + MIN_FREE:
+            # Tránh chiếm nhiều dung lượng cùng lúc khi đĩa gần đầy.
+            log('  Dung lượng tạm thấp: tải lần lượt version này.')
+            return
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {executor.submit(self.get, file): file for file in unique.values()}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    # Phần xử lý chính vẫn áp dụng cách loại/ghi lỗi như bản trước.
+                    log('  Chưa tải trước được '+futures[future]['relative_path']+': '+type(exc).__name__)
 
     def text(self, file):
         if file['size'] > MAX_TEXT:
@@ -639,6 +672,22 @@ def merge_version(records, dl, work, name, version_key, display_version, previou
     notes, rejected, metadata, files = [], [], [], []
     for r in records:
         files.extend((r, f) for f in r['files'])
+    if hasattr(dl, 'prefetch'):
+        originals = [f for _, f in files if '/' not in f['relative_path']
+                     and is_archive(f['relative_path']) and f['relative_path'].lower() not in SRC_ZIPS]
+        source_zips = [f for _, f in files if f['relative_path'].lower() in SRC_ZIPS]
+        preload = list(originals or source_zips)
+        for _, f in files:
+            rel, lower = f['relative_path'], f['relative_path'].lower()
+            if '/' not in rel and (lower in META_NAMES or re.fullmatch(r'readme(?:\.[a-z0-9_-]+)?', lower)
+                    or 'version_change' in lower or 'change_version' in lower
+                    or lower in ('history-commit.md', 'history_commit.md', 'commits.json', 'commit_history.json')):
+                preload.append(f)
+            elif rel.startswith('commit/'):
+                preload.append(f)
+            elif not originals and not source_zips and '/' in rel and rel.split('/')[0] in SRC_DIRS:
+                preload.append(f)
+        dl.prefetch(preload)
     for r, f in files:
         if f['relative_path'].lower() not in META_NAMES:
             continue
@@ -833,6 +882,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path.home()/'datasets/Dataset-Tong-hop')
     parser.add_argument('--package', help='Chỉ gộp thử một package, ví dụ humanqueen')
+    parser.add_argument('--download-workers', type=int, choices=range(1, 9), default=4,
+                        help='Số tệp tải đồng thời trong một version (mặc định 4, tối đa 8)')
     args = parser.parse_args(argv)
     output = args.output.expanduser().resolve()
     control = output.parent/(output.name+'_quan_ly')
@@ -851,6 +902,7 @@ def run(args, output, control):
     from huggingface_hub import HfApi
     api = HfApi()
     log('Nguồn: Duy + Long + Phúc + Tiến. Bỏ qua Đạt. Chỉ tạo dữ liệu local.')
+    log(f'Tải đồng thời tối đa {args.download_workers} tệp; kiểm tra và gộp từng version.')
     inv = inventory(api, control)
     groups = defaultdict(list)
     for record in inv['records']:
@@ -912,7 +964,7 @@ def run(args, output, control):
                 if work.exists():
                     shutil.rmtree(work)
                 work.mkdir()
-                dl = Downloads(work, inv['revision'])
+                dl = Downloads(work, inv['revision'], args.download_workers)
                 previous = versions[name][j-1][2] if j else None
                 try:
                     result, ready = merge_version(groups[(name, version_key)], dl, work,
@@ -933,7 +985,7 @@ def run(args, output, control):
                     # Xóa bản tải tạm của version đã xử lý, không giữ cả bốn bản tải.
                     if work.exists():
                         shutil.rmtree(work)
-                if index % 20 == 0:
+                if index % 100 == 0:
                     report(control, output, inv, results, failures)
     except KeyboardInterrupt:
         interrupted = True
